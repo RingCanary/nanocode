@@ -315,6 +315,13 @@ def execute_tool(tool_name, tool_args):
 def run_anthropic_turn(messages, system_prompt):
     while True:
         response = call_api(messages, system_prompt)
+        # Display token usage if available
+        usage = response.get("usage")
+        if usage:
+            total = usage.get("total_tokens")
+            if total is None:
+                total = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            print(f"{YELLOW}🔢 Tokens used: {total}{RESET}")
         content_blocks = response.get("content", [])
         tool_results = []
 
@@ -368,6 +375,13 @@ def parse_tool_args(raw_args):
 def run_inception_turn(messages, system_prompt):
     while True:
         response = call_api(messages, system_prompt)
+        # Display token usage if available
+        usage = response.get("usage")
+        if usage:
+            total = usage.get("total_tokens")
+            if total is None:
+                total = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            print(f"{YELLOW}🔢 Tokens used: {total}{RESET}")
         choice = (response.get("choices") or [{}])[0]
         message = choice.get("message", {})
 
