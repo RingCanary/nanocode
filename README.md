@@ -10,6 +10,7 @@ Built using Claude Code, then used to build itself.
 
 - Full agentic loop with tool use
 - Tools: `read`, `write`, `edit`, `glob`, `grep`, `bash`
+- Per-turn and session token usage summaries
 - Conversation history
 - Colored terminal output
 
@@ -62,6 +63,8 @@ NANOCODE_DRY_RUN=1 NANOCODE_PROVIDER=inception python nanocode.py
 
 ## Commands
 
+- `/h` or `/help` - Show commands
+- `/stats` - Show session token stats
 - `/c` - Clear conversation
 - `/q` or `exit` - Quit
 

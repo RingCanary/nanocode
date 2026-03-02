@@ -4,3 +4,5 @@
 - 1772437841 | Ran dry-run verification for inception/anthropic/openrouter flows and syntax compile check.
 - 1772437841 | Updated README usage docs for Mercury provider and dry-run workflow.
 - 1772437884 | Checkpoint commit created for core Mercury integration (cc168db).
+- 1772477176 | Improved token accounting (normalized usage parsing, per-turn + session totals, /stats, /help).
+- 1772477176 | Checkpoint commit created for token/UI improvements (f0d6ed3).
