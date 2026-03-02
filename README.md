@@ -75,6 +75,7 @@ NANOCODE_DRY_RUN=1 NANOCODE_PROVIDER=inception python nanocode.py
 
 - `/h` or `/help` - Show commands
 - `/stats` - Show session token stats
+- `Esc` - Interrupt a running `bash` tool command
 - `/c` - Clear conversation
 - `/q` or `exit` - Quit
 
@@ -87,7 +88,7 @@ NANOCODE_DRY_RUN=1 NANOCODE_PROVIDER=inception python nanocode.py
 | `edit` | Replace string in file (must be unique) |
 | `glob` | Find files by pattern, sorted by mtime |
 | `grep` | Search files for regex |
-| `bash` | Run shell command |
+| `bash` | Run shell command (timeout 30s, press `Esc` to interrupt) |
 
 ## Example
 

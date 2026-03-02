@@ -9,3 +9,5 @@
 - 1772477483 | Updated README with original author credit, experimental fork note, and Codex + Mercury 2 improvements.
 - 1772477510 | Push blocked: no git remote configured and GitHub CLI auth token is invalid/missing.
 - 1772477638 | Created GitHub repo RingCanary/nanocode with gh and pushed master.
+- 1772478273 | Added Esc-based interrupt support for running bash tool commands (while keeping 30s timeout).
+- 1772478273 | Checkpoint commit created for Esc interrupt feature (ffc8a30).
