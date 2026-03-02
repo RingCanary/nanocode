@@ -1,6 +1,6 @@
 # nanocode
 
-Minimal Claude Code alternative. Single Python file, zero dependencies, ~250 lines.
+Minimal coding assistant. Single Python file, zero dependencies, ~300 lines.
 
 Built using Claude Code, then used to build itself.
 
@@ -20,6 +20,21 @@ export ANTHROPIC_API_KEY="your-key"
 python nanocode.py
 ```
 
+### Inception (Mercury)
+
+```bash
+export INCEPTION_API_KEY="your-key"
+python nanocode.py
+```
+
+Optional:
+
+```bash
+export NANOCODE_PROVIDER="inception"
+export MODEL="mercury-2"
+python nanocode.py
+```
+
 ### OpenRouter
 
 Use [OpenRouter](https://openrouter.ai) to access any model:
@@ -36,6 +51,14 @@ export OPENROUTER_API_KEY="your-key"
 export MODEL="openai/gpt-5.2"
 python nanocode.py
 ```
+
+### Dry Run (No API key)
+
+```bash
+NANOCODE_DRY_RUN=1 NANOCODE_PROVIDER=inception python nanocode.py
+```
+
+`NANOCODE_PROVIDER` supports: `anthropic`, `openrouter`, `inception`.
 
 ## Commands
 
