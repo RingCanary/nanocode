@@ -8,3 +8,4 @@
 - 1772477176 | Checkpoint commit created for token/UI improvements (f0d6ed3).
 - 1772477483 | Updated README with original author credit, experimental fork note, and Codex + Mercury 2 improvements.
 - 1772477510 | Push blocked: no git remote configured and GitHub CLI auth token is invalid/missing.
+- 1772477638 | Created GitHub repo RingCanary/nanocode with gh and pushed master.
