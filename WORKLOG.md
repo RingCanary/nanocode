@@ -11,3 +11,5 @@
 - 1772477638 | Created GitHub repo RingCanary/nanocode with gh and pushed master.
 - 1772478273 | Added Esc-based interrupt support for running bash tool commands (while keeping 30s timeout).
 - 1772478273 | Checkpoint commit created for Esc interrupt feature (ffc8a30).
+- 1772478698 | Added minimal API resilience: timeout, HTTP/network/non-JSON handling, Accept header, and Inception tuning env vars.
+- 1772478707 | Checkpoint commit created for minimal API resilience improvements (593ea26).

@@ -46,6 +46,16 @@ export MODEL="mercury-2"
 python nanocode.py
 ```
 
+Optional tuning (Inception):
+
+```bash
+export NANOCODE_REASONING_EFFORT="low"     # instant|low|medium|high
+export NANOCODE_REASONING_SUMMARY="true"   # true|false
+export NANOCODE_TEMPERATURE="0.7"
+export NANOCODE_STOP="</end>||DONE"        # up to 4 stop sequences
+python nanocode.py
+```
+
 ### OpenRouter
 
 Use [OpenRouter](https://openrouter.ai) to access any model:
@@ -70,6 +80,7 @@ NANOCODE_DRY_RUN=1 NANOCODE_PROVIDER=inception python nanocode.py
 ```
 
 `NANOCODE_PROVIDER` supports: `anthropic`, `openrouter`, `inception`.
+`NANOCODE_HTTP_TIMEOUT` controls API timeout seconds (minimum 15, default 30).
 
 ## Commands
 
