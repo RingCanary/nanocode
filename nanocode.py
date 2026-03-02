@@ -217,7 +217,12 @@ def call_api_anthropic(messages, system_prompt):
                     "type": "text",
                     "text": f"[dry-run] {PROVIDER_LABEL} request prepared for {API_URL} with model {MODEL}",
                 }
-            ]
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 8,
+                "total_tokens": 20,
+            },
         }
     request = urllib.request.Request(
         API_URL,
@@ -254,7 +259,12 @@ def call_api_inception(messages):
                         "content": f"[dry-run] Inception request prepared for {API_URL} with model {MODEL}",
                     }
                 }
-            ]
+            ],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
+                "total_tokens": 20,
+            },
         }
 
     request = urllib.request.Request(
@@ -294,6 +304,99 @@ def render_markdown(text):
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
+def new_usage_bucket():
+    return {
+        "calls": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0,
+        "has_input": 0,
+        "has_output": 0,
+        "has_total": 0,
+    }
+
+
+def extract_usage(response):
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    input_tokens = usage.get("input_tokens")
+    if input_tokens is None:
+        input_tokens = usage.get("prompt_tokens")
+
+    output_tokens = usage.get("output_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens")
+
+    total_tokens = usage.get("total_tokens")
+    if (
+        total_tokens is None
+        and isinstance(input_tokens, int)
+        and isinstance(output_tokens, int)
+    ):
+        total_tokens = input_tokens + output_tokens
+
+    if not any(isinstance(v, int) for v in (input_tokens, output_tokens, total_tokens)):
+        return None
+
+    return {
+        "input": input_tokens if isinstance(input_tokens, int) else None,
+        "output": output_tokens if isinstance(output_tokens, int) else None,
+        "total": total_tokens if isinstance(total_tokens, int) else None,
+    }
+
+
+def add_usage(bucket, usage):
+    if not usage:
+        return
+    bucket["calls"] += 1
+    if usage["input"] is not None:
+        bucket["input"] += usage["input"]
+        bucket["has_input"] += 1
+    if usage["output"] is not None:
+        bucket["output"] += usage["output"]
+        bucket["has_output"] += 1
+    if usage["total"] is not None:
+        bucket["total"] += usage["total"]
+        bucket["has_total"] += 1
+
+
+def usage_parts(bucket):
+    parts = []
+    if bucket["has_input"]:
+        parts.append(f"in {bucket['input']}")
+    if bucket["has_output"]:
+        parts.append(f"out {bucket['output']}")
+    if bucket["has_total"]:
+        parts.append(f"total {bucket['total']}")
+    return parts
+
+
+def print_usage_summary(turn_usage, session_usage):
+    if not turn_usage["calls"]:
+        return
+    turn_parts = usage_parts(turn_usage)
+    session_parts = usage_parts(session_usage)
+    text = f"🔢 Turn tokens: {' | '.join(turn_parts) or 'unknown'}"
+    if session_parts:
+        text += f" | session {' | '.join(session_parts)}"
+    print(f"{YELLOW}{text}{RESET}")
+
+
+def print_help():
+    print(f"{DIM}Commands: /h /help, /stats, /c, /q, exit{RESET}")
+
+
+def print_stats(session_usage):
+    if not session_usage["calls"]:
+        print(f"{DIM}No token usage recorded yet.{RESET}")
+        return
+    parts = usage_parts(session_usage)
+    print(f"{YELLOW}🔢 Session tokens: {' | '.join(parts)}{RESET}")
+    print(f"{DIM}API calls: {session_usage['calls']}{RESET}")
+
+
 def preview_result(result):
     result_lines = result.split("\n")
     preview = result_lines[0][:60]
@@ -312,16 +415,13 @@ def execute_tool(tool_name, tool_args):
     return result
 
 
-def run_anthropic_turn(messages, system_prompt):
+def run_anthropic_turn(messages, system_prompt, session_usage):
+    turn_usage = new_usage_bucket()
     while True:
         response = call_api(messages, system_prompt)
-        # Display token usage if available
-        usage = response.get("usage")
-        if usage:
-            total = usage.get("total_tokens")
-            if total is None:
-                total = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            print(f"{YELLOW}🔢 Tokens used: {total}{RESET}")
+        usage = extract_usage(response)
+        add_usage(turn_usage, usage)
+        add_usage(session_usage, usage)
         content_blocks = response.get("content", [])
         tool_results = []
 
@@ -345,6 +445,7 @@ def run_anthropic_turn(messages, system_prompt):
         if not tool_results:
             break
         messages.append({"role": "user", "content": tool_results})
+    return turn_usage
 
 
 def normalize_openai_content(content):
@@ -372,16 +473,13 @@ def parse_tool_args(raw_args):
         return {}
 
 
-def run_inception_turn(messages, system_prompt):
+def run_inception_turn(messages, system_prompt, session_usage):
+    turn_usage = new_usage_bucket()
     while True:
         response = call_api(messages, system_prompt)
-        # Display token usage if available
-        usage = response.get("usage")
-        if usage:
-            total = usage.get("total_tokens")
-            if total is None:
-                total = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            print(f"{YELLOW}🔢 Tokens used: {total}{RESET}")
+        usage = extract_usage(response)
+        add_usage(turn_usage, usage)
+        add_usage(session_usage, usage)
         choice = (response.get("choices") or [{}])[0]
         message = choice.get("message", {})
 
@@ -410,6 +508,7 @@ def run_inception_turn(messages, system_prompt):
                     "content": result,
                 }
             )
+    return turn_usage
 
 
 def check_api_key():
@@ -439,8 +538,10 @@ def main():
     print(
         f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({PROVIDER_LABEL}) | {os.getcwd()}{RESET}\n"
     )
+    print_help()
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
     messages = initial_messages(system_prompt)
+    session_usage = new_usage_bucket()
 
     while True:
         try:
@@ -451,6 +552,12 @@ def main():
                 continue
             if user_input in ("/q", "exit"):
                 break
+            if user_input in ("/h", "/help"):
+                print_help()
+                continue
+            if user_input == "/stats":
+                print_stats(session_usage)
+                continue
             if user_input == "/c":
                 messages = initial_messages(system_prompt)
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
@@ -459,10 +566,11 @@ def main():
             messages.append({"role": "user", "content": user_input})
 
             if PROVIDER == "inception":
-                run_inception_turn(messages, system_prompt)
+                turn_usage = run_inception_turn(messages, system_prompt, session_usage)
             else:
-                run_anthropic_turn(messages, system_prompt)
+                turn_usage = run_anthropic_turn(messages, system_prompt, session_usage)
 
+            print_usage_summary(turn_usage, session_usage)
             print()
 
         except (KeyboardInterrupt, EOFError):
