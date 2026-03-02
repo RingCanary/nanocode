@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nanocode - minimal coding assistant"""
 
-import glob as globlib, json, os, re, subprocess, urllib.request
+import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, threading, time, tty, urllib.request
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -52,6 +52,33 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 
 
 # --- Tool implementations ---
+
+
+class EscKeyWatcher:
+    def __init__(self):
+        self.enabled = os.name == "posix" and sys.stdin.isatty()
+        self.fd = None
+        self.old_settings = None
+
+    def __enter__(self):
+        if self.enabled:
+            self.fd = sys.stdin.fileno()
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        if self.enabled and self.fd is not None and self.old_settings is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+    def esc_pressed(self):
+        if not self.enabled or self.fd is None:
+            return False
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        if not ready:
+            return False
+        key = os.read(self.fd, 1)
+        return key == b"\x1b"
 
 
 def read(args):
@@ -111,22 +138,56 @@ def grep(args):
 def bash(args):
     proc = subprocess.Popen(
         args["cmd"], shell=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
     output_lines = []
+    output_queue = queue.Queue()
+    done = object()
+
+    def stream_output():
+        for line in proc.stdout:
+            output_queue.put(line)
+        output_queue.put(done)
+
+    reader = threading.Thread(target=stream_output, daemon=True)
+    reader.start()
+
+    interrupted = False
+    started_at = time.monotonic()
+
     try:
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                print(f"  {DIM}│ {line.rstrip()}{RESET}", flush=True)
-                output_lines.append(line)
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        output_lines.append("\n(timed out after 30s)")
+        with EscKeyWatcher() as key_watcher:
+            while True:
+                try:
+                    line = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    line = None
+
+                if line is done:
+                    if proc.poll() is not None:
+                        break
+                elif line:
+                    print(f"  {DIM}│ {line.rstrip()}{RESET}", flush=True)
+                    output_lines.append(line)
+
+                if not interrupted and key_watcher.esc_pressed():
+                    interrupted = True
+                    proc.terminate()
+                    output_lines.append("\n(interrupted by Esc)")
+
+                if not interrupted and time.monotonic() - started_at > 30:
+                    proc.kill()
+                    output_lines.append("\n(timed out after 30s)")
+
+                if proc.poll() is not None and output_queue.empty():
+                    break
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
     return "".join(output_lines).strip() or "(empty)"
 
 
@@ -410,6 +471,8 @@ def preview_result(result):
 def execute_tool(tool_name, tool_args):
     arg_preview = str(next(iter(tool_args.values()), ""))[:50]
     print(f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})")
+    if tool_name == "bash":
+        print(f"  {DIM}⎿  Press Esc to interrupt{RESET}")
     result = run_tool(tool_name, tool_args)
     print(f"  {DIM}⎿  {preview_result(result)}{RESET}")
     return result
