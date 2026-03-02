@@ -7,3 +7,4 @@
 - 1772477176 | Improved token accounting (normalized usage parsing, per-turn + session totals, /stats, /help).
 - 1772477176 | Checkpoint commit created for token/UI improvements (f0d6ed3).
 - 1772477483 | Updated README with original author credit, experimental fork note, and Codex + Mercury 2 improvements.
+- 1772477510 | Push blocked: no git remote configured and GitHub CLI auth token is invalid/missing.
