@@ -6,3 +6,4 @@
 - 1772437884 | Checkpoint commit created for core Mercury integration (cc168db).
 - 1772477176 | Improved token accounting (normalized usage parsing, per-turn + session totals, /stats, /help).
 - 1772477176 | Checkpoint commit created for token/UI improvements (f0d6ed3).
+- 1772477483 | Updated README with original author credit, experimental fork note, and Codex + Mercury 2 improvements.

@@ -4,11 +4,21 @@ Minimal coding assistant. Single Python file, zero dependencies, ~300 lines.
 
 Built using Claude Code, then used to build itself.
 
+## Experimental Fork
+
+This repository is an experimental fork of the original project by [1rgs/nanocode](https://github.com/1rgs/nanocode).
+
+Fork updates in this repo:
+- Improved with Codex
+- Added Inception Mercury 2 support (`INCEPTION_API_KEY`, `NANOCODE_PROVIDER=inception`)
+- Added a Mercury 2-powered feature: per-turn and session token usage summaries
+
 ![screenshot](screenshot.png)
 
 ## Features
 
 - Full agentic loop with tool use
+- Inception Mercury 2 provider support
 - Tools: `read`, `write`, `edit`, `glob`, `grep`, `bash`
 - Per-turn and session token usage summaries
 - Conversation history
