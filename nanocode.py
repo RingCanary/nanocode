@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """nanocode - minimal coding assistant"""
 
-import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, threading, time, tty, urllib.request
+import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, threading, time, tty, urllib.error, urllib.request
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 INCEPTION_KEY = os.environ.get("INCEPTION_API_KEY")
 DRY_RUN = os.environ.get("NANOCODE_DRY_RUN", "").lower() in {"1", "true", "yes"}
+try:
+    REQUEST_TIMEOUT = max(15, int(os.environ.get("NANOCODE_HTTP_TIMEOUT", "30")))
+except ValueError:
+    REQUEST_TIMEOUT = 30
 
 
 def detect_provider():
@@ -270,6 +274,65 @@ def make_schema(provider):
     return result
 
 
+def parse_bool_env(name):
+    value = os.environ.get(name, "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def inception_optional_params():
+    params = {}
+
+    reasoning_effort = os.environ.get("NANOCODE_REASONING_EFFORT", "").strip().lower()
+    if reasoning_effort in {"instant", "low", "medium", "high"}:
+        params["reasoning_effort"] = reasoning_effort
+
+    reasoning_summary = parse_bool_env("NANOCODE_REASONING_SUMMARY")
+    if reasoning_summary is not None:
+        params["reasoning_summary"] = reasoning_summary
+
+    temperature = os.environ.get("NANOCODE_TEMPERATURE", "").strip()
+    if temperature:
+        try:
+            params["temperature"] = float(temperature)
+        except ValueError:
+            pass
+
+    stop = os.environ.get("NANOCODE_STOP", "").strip()
+    if stop:
+        stops = [item for item in stop.split("||") if item]
+        if stops:
+            params["stop"] = stops[:4]
+
+    return params
+
+
+def decode_json_bytes(data):
+    text = data.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        snippet = text[:300].strip().replace("\n", " ")
+        raise RuntimeError(
+            f"Non-JSON response from {PROVIDER_LABEL}: {snippet or '<empty>'}"
+        )
+
+
+def request_json(request):
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            return decode_json_bytes(response.read())
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace").strip()
+        detail = body[:300] if body else str(err.reason)
+        raise RuntimeError(f"HTTP {err.code} from {PROVIDER_LABEL}: {detail}")
+    except urllib.error.URLError as err:
+        raise RuntimeError(f"Network error from {PROVIDER_LABEL}: {err.reason}")
+
+
 def call_api_anthropic(messages, system_prompt):
     if DRY_RUN:
         return {
@@ -298,6 +361,7 @@ def call_api_anthropic(messages, system_prompt):
         ).encode(),
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "anthropic-version": "2023-06-01",
             **(
                 {"Authorization": f"Bearer {OPENROUTER_KEY}"}
@@ -306,8 +370,7 @@ def call_api_anthropic(messages, system_prompt):
             ),
         },
     )
-    response = urllib.request.urlopen(request)
-    return json.loads(response.read())
+    return request_json(request)
 
 
 def call_api_inception(messages):
@@ -336,15 +399,16 @@ def call_api_inception(messages):
                 "max_tokens": 8192,
                 "messages": messages,
                 "tools": make_schema("inception"),
+                **inception_optional_params(),
             }
         ).encode(),
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "Authorization": f"Bearer {INCEPTION_KEY or ''}",
         },
     )
-    response = urllib.request.urlopen(request)
-    return json.loads(response.read())
+    return request_json(request)
 
 
 def call_api(messages, system_prompt):
