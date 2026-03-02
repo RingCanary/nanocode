@@ -1,6 +1,6 @@
 # nanocode
 
-Minimal coding assistant. Single Python file, zero dependencies, ~300 lines.
+Minimal coding assistant. Single Python file, zero dependencies, ~700 lines.
 
 Built using Claude Code, then used to build itself.
 
