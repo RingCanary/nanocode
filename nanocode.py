@@ -52,7 +52,7 @@ PROVIDERS = {
     },
     "zai": {
         "label": "z.ai",
-        "api_url": "https://api.z.ai/api/paas/v4/chat/completions",
+        "api_url": "https://api.z.ai/api/coding/paas/v4",
         "default_model": "glm-5",
         "key_env": "ZAI_API_KEY",
         "style": "openai",
@@ -396,6 +396,15 @@ def provider_headers(provider):
     return headers
 
 
+def provider_api_url(provider):
+    url = PROVIDERS[provider]["api_url"].rstrip("/")
+    if PROVIDERS[provider]["style"] == "openai" and not url.endswith(
+        "/chat/completions"
+    ):
+        return f"{url}/chat/completions"
+    return url
+
+
 def decode_json_bytes(data):
     text = data.decode("utf-8", errors="replace")
     try:
@@ -421,7 +430,8 @@ def request_json(request):
 
 def dry_run_response(provider):
     cfg = PROVIDERS[provider]
-    text = f"[dry-run] {cfg['label']} request prepared for {cfg['api_url']} with model {MODEL}"
+    api_url = provider_api_url(provider)
+    text = f"[dry-run] {cfg['label']} request prepared for {api_url} with model {MODEL}"
     if cfg["style"] == "openai":
         message = {"role": "assistant", "content": text}
         if provider == "zai" and ZAI_CODING_PLAN:
@@ -440,7 +450,7 @@ def call_api(messages, system_prompt, provider):
     if DRY_RUN:
         return dry_run_response(provider)
     request = urllib.request.Request(
-        PROVIDERS[provider]["api_url"],
+        provider_api_url(provider),
         data=json.dumps(build_request(messages, system_prompt, provider)).encode(),
         headers=provider_headers(provider),
     )
