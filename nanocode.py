@@ -1,395 +1,102 @@
 #!/usr/bin/env python3
 """nanocode - minimal coding assistant"""
 
-import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, threading, time, tty, urllib.error, urllib.request
-
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
-INCEPTION_KEY = os.environ.get("INCEPTION_API_KEY")
-ZAI_KEY = os.environ.get("ZAI_API_KEY")
-DRY_RUN = os.environ.get("NANOCODE_DRY_RUN", "").lower() in {"1", "true", "yes"}
-ZAI_CODING_PLAN = os.environ.get("NANOCODE_ZAI_CODING_PLAN", "").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-try:
-    REQUEST_TIMEOUT = max(15, int(os.environ.get("NANOCODE_HTTP_TIMEOUT", "30")))
-except ValueError:
-    REQUEST_TIMEOUT = 30
+import glob as globlib, json, os, re, subprocess, urllib.error, urllib.request
 
 
-def parse_bool_env(name):
+def env_bool(name, tri_state=False):
     value = os.environ.get(name, "").strip().lower()
     if value in {"1", "true", "yes", "on"}:
         return True
     if value in {"0", "false", "no", "off"}:
         return False
-    return None
+    return None if tri_state else False
 
 
-def inception_optional_params():
-    params = {}
-
-    reasoning_effort = os.environ.get("NANOCODE_REASONING_EFFORT", "").strip().lower()
-    if reasoning_effort in {"instant", "low", "medium", "high"}:
-        params["reasoning_effort"] = reasoning_effort
-
-    reasoning_summary = parse_bool_env("NANOCODE_REASONING_SUMMARY")
-    if reasoning_summary is not None:
-        params["reasoning_summary"] = reasoning_summary
-
-    temperature = os.environ.get("NANOCODE_TEMPERATURE", "").strip()
-    if temperature:
-        try:
-            params["temperature"] = float(temperature)
-        except ValueError:
-            pass
-
-    stop = os.environ.get("NANOCODE_STOP", "").strip()
-    if stop:
-        stops = [item for item in stop.split("||") if item]
-        if stops:
-            params["stop"] = stops[:4]
-
-    return params
-
-
-def parse_tool_args(raw_args):
-    if isinstance(raw_args, dict):
-        return raw_args
-    if not raw_args:
-        return {}
-    try:
-        return json.loads(raw_args)
-    except json.JSONDecodeError:
-        return {}
-
-
-def normalize_openai_content(content):
-    if isinstance(content, str):
-        return [content]
-    if isinstance(content, list):
-        text_chunks = []
-        for item in content:
-            if isinstance(item, str):
-                text_chunks.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                text_chunks.append(item.get("text", ""))
-        text = "".join(text_chunks)
-        return [text] if text else []
-    return []
-
-
-def extract_usage_tuple(response):
-    usage = response.get("usage")
-    if not isinstance(usage, dict):
-        return (None, None, None)
-
-    input_tokens = usage.get("input_tokens")
-    if input_tokens is None:
-        input_tokens = usage.get("prompt_tokens")
-
-    output_tokens = usage.get("output_tokens")
-    if output_tokens is None:
-        output_tokens = usage.get("completion_tokens")
-
-    total_tokens = usage.get("total_tokens")
-    if (
-        total_tokens is None
-        and isinstance(input_tokens, int)
-        and isinstance(output_tokens, int)
-    ):
-        total_tokens = input_tokens + output_tokens
-
-    return (
-        input_tokens if isinstance(input_tokens, int) else None,
-        output_tokens if isinstance(output_tokens, int) else None,
-        total_tokens if isinstance(total_tokens, int) else None,
-    )
-
-
-def parse_anthropic_response(response):
-    texts = []
-    tool_calls = []
-    for block in response.get("content", []):
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
-            texts.append(block["text"])
-        if block.get("type") == "tool_use":
-            tool_calls.append(
-                {
-                    "name": block.get("name", ""),
-                    "args": block.get("input", {}),
-                    "id": block.get("id", ""),
-                }
-            )
-    return {
-        "assistant_text": texts,
-        "tool_calls": tool_calls,
-        "usage": extract_usage_tuple(response),
-        "assistant_payload": response.get("content", []),
-    }
-
-
-def parse_openai_response(response):
-    choice = (response.get("choices") or [{}])[0]
-    message = choice.get("message", {}) if isinstance(choice, dict) else {}
-    tool_calls = []
-    for tool_call in message.get("tool_calls") or []:
-        function_call = tool_call.get("function", {})
-        tool_calls.append(
-            {
-                "name": function_call.get("name", ""),
-                "args": parse_tool_args(function_call.get("arguments")),
-                "id": tool_call.get("id", ""),
-            }
-        )
-    text_list = normalize_openai_content(message.get("content"))
-    return {
-        "assistant_text": text_list,
-        "tool_calls": tool_calls,
-        "usage": extract_usage_tuple(response),
-        "assistant_payload": {
-            "role": "assistant",
-            "content": "".join(text_list),
-            **({"tool_calls": message.get("tool_calls")} if tool_calls else {}),
-        },
-    }
-
-
-def extract_zai_plan(choice, message):
-    if not ZAI_CODING_PLAN:
-        return ""
-
-    for source in (message, choice):
-        if not isinstance(source, dict):
-            continue
-        for key in ("coding_plan", "plan", "reasoning", "analysis"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, dict):
-                text = value.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-    return ""
-
-
-def parse_zai_response(response):
-    parsed = parse_openai_response(response)
-    choice = (response.get("choices") or [{}])[0]
-    message = choice.get("message", {}) if isinstance(choice, dict) else {}
-    plan_text = extract_zai_plan(choice, message)
-    if plan_text:
-        assistant_text = parsed.get("assistant_text")
-        parsed["assistant_text"] = (
-            [plan_text, *assistant_text]
-            if isinstance(assistant_text, list)
-            else [plan_text]
-        )
-    return parsed
-
-
-def build_anthropic_request(messages, system_prompt, provider):
-    return {
-        "model": MODEL,
-        "max_tokens": 8192,
-        "system": system_prompt,
-        "messages": messages,
-        "tools": make_schema(provider),
-    }
-
-
-def build_inception_request(messages, _system_prompt, provider):
-    return {
-        "model": MODEL,
-        "max_tokens": 8192,
-        "messages": messages,
-        "tools": make_schema(provider),
-        **inception_optional_params(),
-    }
-
-
-def build_zai_request(messages, _system_prompt, provider):
-    payload = {
-        "model": MODEL,
-        "max_tokens": 8192,
-        "messages": messages,
-        "tools": make_schema(provider),
-    }
-    if ZAI_CODING_PLAN:
-        payload["coding_plan"] = True
-    return payload
-
-
-def detect_provider():
-    explicit_provider = os.environ.get("NANOCODE_PROVIDER", "").strip().lower()
-    if explicit_provider == "z_ai":
-        explicit_provider = "zai"
-    if explicit_provider in PROVIDERS:
-        return explicit_provider
-    for provider in ("inception", "zai", "openrouter"):
-        key_name = PROVIDERS[provider]["key_env"]
-        if os.environ.get(key_name):
-            return provider
-    return "anthropic"
-
-
+DRY_RUN = env_bool("NANOCODE_DRY_RUN")
+ZAI_CODING_PLAN = env_bool("NANOCODE_ZAI_CODING_PLAN")
+try:
+    REQUEST_TIMEOUT = max(15, int(os.environ.get("NANOCODE_HTTP_TIMEOUT", "30")))
+except ValueError:
+    REQUEST_TIMEOUT = 30
 PROVIDERS = {
     "anthropic": {
-        "name": "anthropic",
         "label": "Anthropic",
         "api_url": "https://api.anthropic.com/v1/messages",
         "default_model": "claude-opus-4-5",
         "key_env": "ANTHROPIC_API_KEY",
-        "build_request": build_anthropic_request,
-        "parse_response": parse_anthropic_response,
-        "headers": lambda: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "anthropic-version": "2023-06-01",
-            "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
-        },
-        "initial_messages": lambda system_prompt: [],
-        "tool_message": lambda tool_call, result: {
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call["id"],
-                    "content": result,
-                }
-            ],
-        },
+        "style": "anthropic",
+        "auth_header": "x-api-key",
+        "auth_prefix": "",
+        "system_message": False,
     },
     "openrouter": {
-        "name": "openrouter",
         "label": "OpenRouter",
         "api_url": "https://openrouter.ai/api/v1/messages",
         "default_model": "anthropic/claude-opus-4.5",
         "key_env": "OPENROUTER_API_KEY",
-        "build_request": build_anthropic_request,
-        "parse_response": parse_anthropic_response,
-        "headers": lambda: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "anthropic-version": "2023-06-01",
-            "Authorization": f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}",
-        },
-        "initial_messages": lambda system_prompt: [],
-        "tool_message": lambda tool_call, result: {
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call["id"],
-                    "content": result,
-                }
-            ],
-        },
+        "style": "anthropic",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "system_message": False,
     },
     "inception": {
-        "name": "inception",
         "label": "Inception",
         "api_url": "https://api.inceptionlabs.ai/v1/chat/completions",
         "default_model": "mercury-2",
         "key_env": "INCEPTION_API_KEY",
-        "build_request": build_inception_request,
-        "parse_response": parse_openai_response,
-        "headers": lambda: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {os.environ.get('INCEPTION_API_KEY', '')}",
-        },
-        "initial_messages": lambda system_prompt: [
-            {"role": "system", "content": system_prompt}
-        ],
-        "tool_message": lambda tool_call, result: {
-            "role": "tool",
-            "tool_call_id": tool_call["id"],
-            "content": result,
-        },
+        "style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "system_message": True,
     },
     "zai": {
-        "name": "zai",
         "label": "z.ai",
         "api_url": "https://api.z.ai/api/paas/v4/chat/completions",
-        "default_model": "glm-4.5",
+        "default_model": "glm-5",
         "key_env": "ZAI_API_KEY",
-        "build_request": build_zai_request,
-        "parse_response": parse_zai_response,
-        "headers": lambda: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {os.environ.get('ZAI_API_KEY', '')}",
-        },
-        "initial_messages": lambda system_prompt: [
-            {"role": "system", "content": system_prompt}
-        ],
-        "tool_message": lambda tool_call, result: {
-            "role": "tool",
-            "tool_call_id": tool_call["id"],
-            "content": result,
-        },
+        "style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "system_message": True,
     },
 }
 
+
+def detect_provider():
+    explicit = os.environ.get("NANOCODE_PROVIDER", "").strip().lower()
+    explicit = "zai" if explicit == "z_ai" else explicit
+    if explicit in PROVIDERS:
+        return explicit
+    for provider in ("inception", "zai", "openrouter"):
+        if os.environ.get(PROVIDERS[provider]["key_env"]):
+            return provider
+    return "anthropic"
+
+
 PROVIDER = detect_provider()
-PROVIDER_ADAPTER = PROVIDERS[PROVIDER]
-PROVIDER_LABEL = PROVIDER_ADAPTER["label"]
-API_URL = PROVIDER_ADAPTER["api_url"]
-MODEL = os.environ.get("MODEL", PROVIDER_ADAPTER["default_model"])
-
-# ANSI colors
-RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+PROVIDER_CFG = PROVIDERS[PROVIDER]
+PROVIDER_LABEL = PROVIDER_CFG["label"]
+MODEL = os.environ.get("MODEL", PROVIDER_CFG["default_model"])
+RESET, BOLD, DIM = ("\x1b[0m", "\x1b[1m", "\x1b[2m")
 BLUE, CYAN, GREEN, YELLOW, RED = (
-    "\033[34m",
-    "\033[36m",
-    "\033[32m",
-    "\033[33m",
-    "\033[31m",
+    "\x1b[34m",
+    "\x1b[36m",
+    "\x1b[32m",
+    "\x1b[33m",
+    "\x1b[31m",
 )
-
-
-# --- Tool implementations ---
-
-
-class EscKeyWatcher:
-    def __init__(self):
-        self.enabled = os.name == "posix" and sys.stdin.isatty()
-        self.fd = None
-        self.old_settings = None
-
-    def __enter__(self):
-        if self.enabled:
-            self.fd = sys.stdin.fileno()
-            self.old_settings = termios.tcgetattr(self.fd)
-            tty.setcbreak(self.fd)
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb):
-        if self.enabled and self.fd is not None and self.old_settings is not None:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
-
-    def esc_pressed(self):
-        if not self.enabled or self.fd is None:
-            return False
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
-        if not ready:
-            return False
-        key = os.read(self.fd, 1)
-        return key == b"\x1b"
 
 
 def read(args):
     lines = open(args["path"]).readlines()
-    offset = args.get("offset", 0)
-    limit = args.get("limit", len(lines))
-    selected = lines[offset : offset + limit]
-    return "".join(f"{offset + idx + 1:4}| {line}" for idx, line in enumerate(selected))
+    offset, limit = (args.get("offset", 0), args.get("limit", len(lines)))
+    return "".join(
+        (
+            f"{offset + i + 1:4}| {line}"
+            for i, line in enumerate(lines[offset : offset + limit])
+        )
+    )
 
 
 def write(args):
@@ -400,17 +107,16 @@ def write(args):
 
 def edit(args):
     text = open(args["path"]).read()
-    old, new = args["old"], args["new"]
+    old, new = (args["old"], args["new"])
     if old not in text:
         return "error: old_string not found"
     count = text.count(old)
-    if not args.get("all") and count > 1:
+    if count > 1 and (not args.get("all")):
         return f"error: old_string appears {count} times, must be unique (use all=true)"
-    replacement = (
-        text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
-    )
     with open(args["path"], "w") as f:
-        f.write(replacement)
+        f.write(
+            text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+        )
     return "ok"
 
 
@@ -419,7 +125,7 @@ def glob(args):
     files = globlib.glob(pattern, recursive=True)
     files = sorted(
         files,
-        key=lambda f: os.path.getmtime(f) if os.path.isfile(f) else 0,
+        key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0,
         reverse=True,
     )
     return "\n".join(files) or "none"
@@ -439,66 +145,24 @@ def grep(args):
 
 
 def bash(args):
-    proc = subprocess.Popen(
-        args["cmd"],
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    output_lines = []
-    output_queue = queue.Queue()
-    done = object()
-
-    def stream_output():
-        if proc.stdout is None:
-            output_queue.put(done)
-            return
-        for line in proc.stdout:
-            output_queue.put(line)
-        output_queue.put(done)
-
-    reader = threading.Thread(target=stream_output, daemon=True)
-    reader.start()
-
-    interrupted = False
-    started_at = time.monotonic()
-
     try:
-        with EscKeyWatcher() as key_watcher:
-            while True:
-                try:
-                    line = output_queue.get(timeout=0.1)
-                except queue.Empty:
-                    line = None
+        proc = subprocess.run(
+            args["cmd"],
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        return (proc.stdout or "").strip() or "(empty)"
+    except subprocess.TimeoutExpired as err:
+        output = err.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        if not isinstance(output, str):
+            output = ""
+        return (output + "\n(timed out after 30s)").strip()
 
-                if line is done:
-                    if proc.poll() is not None:
-                        break
-                elif line:
-                    print(f"  {DIM}│ {line.rstrip()}{RESET}", flush=True)
-                    output_lines.append(line)
-
-                if not interrupted and key_watcher.esc_pressed():
-                    interrupted = True
-                    proc.terminate()
-                    output_lines.append("\n(interrupted by Esc)")
-
-                if not interrupted and time.monotonic() - started_at > 30:
-                    proc.kill()
-                    output_lines.append("\n(timed out after 30s)")
-
-                if proc.poll() is not None and output_queue.empty():
-                    break
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-
-    return "".join(output_lines).strip() or "(empty)"
-
-
-# --- Tool definitions: (description, schema, function) ---
 
 TOOLS = {
     "read": (
@@ -506,11 +170,7 @@ TOOLS = {
         {"path": "string", "offset": "number?", "limit": "number?"},
         read,
     ),
-    "write": (
-        "Write content to file",
-        {"path": "string", "content": "string"},
-        write,
-    ),
+    "write": ("Write content to file", {"path": "string", "content": "string"}, write),
     "edit": (
         "Replace old with new in file (old must be unique unless all=true)",
         {"path": "string", "old": "string", "new": "string", "all": "boolean?"},
@@ -526,11 +186,7 @@ TOOLS = {
         {"pat": "string", "path": "string?"},
         grep,
     ),
-    "bash": (
-        "Run shell command",
-        {"cmd": "string"},
-        bash,
-    ),
+    "bash": ("Run shell command", {"cmd": "string"}, bash),
 }
 
 
@@ -541,40 +197,203 @@ def run_tool(name, args):
         return f"error: {err}"
 
 
+def parse_tool_args(raw_args):
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not raw_args:
+        return {}
+    try:
+        return json.loads(raw_args)
+    except json.JSONDecodeError:
+        return {}
+
+
+def normalize_openai_content(content):
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    chunks = []
+    for item in content:
+        if isinstance(item, str):
+            chunks.append(item)
+        elif isinstance(item, dict) and item.get("type") == "text":
+            chunks.append(item.get("text", ""))
+    text = "".join(chunks)
+    return [text] if text else []
+
+
+def extract_usage_tuple(response):
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return (None, None, None)
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if input_tokens is None:
+        input_tokens = usage.get("prompt_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if (
+        total_tokens is None
+        and isinstance(input_tokens, int)
+        and isinstance(output_tokens, int)
+    ):
+        total_tokens = input_tokens + output_tokens
+    return (
+        input_tokens if isinstance(input_tokens, int) else None,
+        output_tokens if isinstance(output_tokens, int) else None,
+        total_tokens if isinstance(total_tokens, int) else None,
+    )
+
+
+def extract_zai_plan(choice, message):
+    if not ZAI_CODING_PLAN:
+        return ""
+    for source in (message, choice):
+        if not isinstance(source, dict):
+            continue
+        for key in ("coding_plan", "plan", "reasoning", "analysis"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                text = value.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+    return ""
+
+
+def parse_response(provider, response):
+    if PROVIDERS[provider]["style"] == "anthropic":
+        texts, tool_calls = ([], [])
+        for block in response.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            if block.get("type") == "tool_use":
+                tool_calls.append(
+                    {
+                        "name": block.get("name", ""),
+                        "args": block.get("input", {}),
+                        "id": block.get("id", ""),
+                    }
+                )
+        payload = {"role": "assistant", "content": response.get("content", [])}
+        return {
+            "assistant_text": texts,
+            "tool_calls": tool_calls,
+            "usage": extract_usage_tuple(response),
+            "assistant_payload": payload,
+        }
+    choice = (response.get("choices") or [{}])[0]
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    raw_tool_calls = message.get("tool_calls") or []
+    tool_calls = []
+    for tool_call in raw_tool_calls:
+        function_call = tool_call.get("function", {})
+        tool_calls.append(
+            {
+                "name": function_call.get("name", ""),
+                "args": parse_tool_args(function_call.get("arguments")),
+                "id": tool_call.get("id", ""),
+            }
+        )
+    message_texts = normalize_openai_content(message.get("content"))
+    plan_text = extract_zai_plan(choice, message) if provider == "zai" else ""
+    display_texts = [plan_text, *message_texts] if plan_text else message_texts
+    payload = {
+        "role": "assistant",
+        "content": "".join(message_texts),
+        **({"tool_calls": raw_tool_calls} if raw_tool_calls else {}),
+    }
+    return {
+        "assistant_text": display_texts,
+        "tool_calls": tool_calls,
+        "usage": extract_usage_tuple(response),
+        "assistant_payload": payload,
+    }
+
+
 def make_schema(provider):
-    result = []
+    openai_style = PROVIDERS[provider]["style"] == "openai"
+    schemas = []
     for name, (description, params, _fn) in TOOLS.items():
         properties = {}
         required = []
         for param_name, param_type in params.items():
-            is_optional = param_type.endswith("?")
             base_type = param_type.rstrip("?")
             properties[param_name] = {
                 "type": "integer" if base_type == "number" else base_type
             }
-            if not is_optional:
+            if not param_type.endswith("?"):
                 required.append(param_name)
         schema = {"type": "object", "properties": properties, "required": required}
-        if provider in {"inception", "zai"}:
-            result.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": schema,
-                    },
-                }
-            )
-        else:
-            result.append(
-                {
+        item = (
+            {
+                "type": "function",
+                "function": {
                     "name": name,
                     "description": description,
-                    "input_schema": schema,
-                }
-            )
-    return result
+                    "parameters": schema,
+                },
+            }
+            if openai_style
+            else {"name": name, "description": description, "input_schema": schema}
+        )
+        schemas.append(item)
+    return schemas
+
+
+def inception_optional_params():
+    params = {}
+    effort = os.environ.get("NANOCODE_REASONING_EFFORT", "").strip().lower()
+    if effort in {"instant", "low", "medium", "high"}:
+        params["reasoning_effort"] = effort
+    summary = env_bool("NANOCODE_REASONING_SUMMARY", tri_state=True)
+    if summary is not None:
+        params["reasoning_summary"] = summary
+    temp = os.environ.get("NANOCODE_TEMPERATURE", "").strip()
+    if temp:
+        try:
+            params["temperature"] = float(temp)
+        except ValueError:
+            pass
+    stop = os.environ.get("NANOCODE_STOP", "").strip()
+    if stop:
+        stops = [item for item in stop.split("||") if item]
+        if stops:
+            params["stop"] = stops[:4]
+    return params
+
+
+def build_request(messages, system_prompt, provider):
+    payload = {
+        "model": MODEL,
+        "max_tokens": 8192,
+        "messages": messages,
+        "tools": make_schema(provider),
+    }
+    style = PROVIDERS[provider]["style"]
+    if style == "anthropic":
+        payload["system"] = system_prompt
+    elif provider == "inception":
+        payload.update(inception_optional_params())
+    elif provider == "zai" and ZAI_CODING_PLAN:
+        payload["coding_plan"] = True
+    return payload
+
+
+def provider_headers(provider):
+    cfg = PROVIDERS[provider]
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if cfg["style"] == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+    headers[cfg["auth_header"]] = (
+        f"{cfg['auth_prefix']}{os.environ.get(cfg['key_env'], '')}"
+    )
+    return headers
 
 
 def decode_json_bytes(data):
@@ -600,13 +419,10 @@ def request_json(request):
         raise RuntimeError(f"Network error from {PROVIDER_LABEL}: {err.reason}")
 
 
-def build_request(messages, system_prompt, provider):
-    return PROVIDERS[provider]["build_request"](messages, system_prompt, provider)
-
-
 def dry_run_response(provider):
-    text = f"[dry-run] {PROVIDERS[provider]['label']} request prepared for {PROVIDERS[provider]['api_url']} with model {MODEL}"
-    if provider in {"inception", "zai"}:
+    cfg = PROVIDERS[provider]
+    text = f"[dry-run] {cfg['label']} request prepared for {cfg['api_url']} with model {MODEL}"
+    if cfg["style"] == "openai":
         message = {"role": "assistant", "content": text}
         if provider == "zai" and ZAI_CODING_PLAN:
             message["coding_plan"] = "[dry-run] coding plan enabled"
@@ -626,9 +442,41 @@ def call_api(messages, system_prompt, provider):
     request = urllib.request.Request(
         PROVIDERS[provider]["api_url"],
         data=json.dumps(build_request(messages, system_prompt, provider)).encode(),
-        headers=PROVIDERS[provider]["headers"](),
+        headers=provider_headers(provider),
     )
     return request_json(request)
+
+
+def new_usage_bucket():
+    return {"calls": 0, "input": None, "output": None, "total": None}
+
+
+def usage_dict(usage_tuple):
+    if not isinstance(usage_tuple, tuple) or len(usage_tuple) != 3:
+        return None
+    input_tokens, output_tokens, total_tokens = usage_tuple
+    if not any((v is not None for v in (input_tokens, output_tokens, total_tokens))):
+        return None
+    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
+
+
+def add_usage(bucket, usage):
+    if not usage:
+        return
+    bucket["calls"] += 1
+    for key in ("input", "output", "total"):
+        value = usage[key]
+        if value is None:
+            continue
+        bucket[key] = value if bucket[key] is None else bucket[key] + value
+
+
+def usage_parts(bucket):
+    parts = []
+    for key, label in (("input", "in"), ("output", "out"), ("total", "total")):
+        if bucket[key] is not None:
+            parts.append(f"{label} {bucket[key]}")
+    return parts
 
 
 def separator():
@@ -640,65 +488,7 @@ def separator():
 
 
 def render_markdown(text):
-    return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
-
-
-def new_usage_bucket():
-    return {
-        "calls": 0,
-        "input": 0,
-        "output": 0,
-        "total": 0,
-        "has_input": 0,
-        "has_output": 0,
-        "has_total": 0,
-    }
-
-
-def usage_dict(usage_tuple):
-    if not isinstance(usage_tuple, tuple) or len(usage_tuple) != 3:
-        return None
-    input_tokens, output_tokens, total_tokens = usage_tuple
-    if not any(v is not None for v in (input_tokens, output_tokens, total_tokens)):
-        return None
-    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
-
-
-def add_usage(bucket, usage):
-    if not usage:
-        return
-    bucket["calls"] += 1
-    if usage["input"] is not None:
-        bucket["input"] += usage["input"]
-        bucket["has_input"] += 1
-    if usage["output"] is not None:
-        bucket["output"] += usage["output"]
-        bucket["has_output"] += 1
-    if usage["total"] is not None:
-        bucket["total"] += usage["total"]
-        bucket["has_total"] += 1
-
-
-def usage_parts(bucket):
-    parts = []
-    if bucket["has_input"]:
-        parts.append(f"in {bucket['input']}")
-    if bucket["has_output"]:
-        parts.append(f"out {bucket['output']}")
-    if bucket["has_total"]:
-        parts.append(f"total {bucket['total']}")
-    return parts
-
-
-def print_usage_summary(turn_usage, session_usage):
-    if not turn_usage["calls"]:
-        return
-    turn_parts = usage_parts(turn_usage)
-    session_parts = usage_parts(session_usage)
-    text = f"🔢 Turn tokens: {' | '.join(turn_parts) or 'unknown'}"
-    if session_parts:
-        text += f" | session {' | '.join(session_parts)}"
-    print(f"{YELLOW}{text}{RESET}")
+    return re.sub("\\*\\*(.+?)\\*\\*", f"{BOLD}\\1{RESET}", text)
 
 
 def print_help():
@@ -709,70 +499,87 @@ def print_stats(session_usage):
     if not session_usage["calls"]:
         print(f"{DIM}No token usage recorded yet.{RESET}")
         return
-    parts = usage_parts(session_usage)
-    print(f"{YELLOW}🔢 Session tokens: {' | '.join(parts)}{RESET}")
+    print(f"{YELLOW}🔢 Session tokens: {' | '.join(usage_parts(session_usage))}{RESET}")
     print(f"{DIM}API calls: {session_usage['calls']}{RESET}")
 
 
+def print_usage_summary(turn_usage, session_usage):
+    if not turn_usage["calls"]:
+        return
+    text = f"🔢 Turn tokens: {' | '.join(usage_parts(turn_usage)) or 'unknown'}"
+    session_parts = usage_parts(session_usage)
+    if session_parts:
+        text += f" | session {' | '.join(session_parts)}"
+    print(f"{YELLOW}{text}{RESET}")
+
+
 def preview_result(result):
-    result_lines = result.split("\n")
-    preview = result_lines[0][:60]
-    if len(result_lines) > 1:
-        preview += f" ... +{len(result_lines) - 1} lines"
-    elif len(result_lines[0]) > 60:
-        preview += "..."
-    return preview
+    lines = result.split("\n")
+    first = lines[0][:60]
+    if len(lines) > 1:
+        return first + f" ... +{len(lines) - 1} lines"
+    if len(lines[0]) > 60:
+        return first + "..."
+    return first
 
 
 def execute_tool(tool_name, tool_args):
     arg_preview = str(next(iter(tool_args.values()), ""))[:50]
     print(f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})")
-    if tool_name == "bash":
-        print(f"  {DIM}⎿  Press Esc to interrupt{RESET}")
     result = run_tool(tool_name, tool_args)
     print(f"  {DIM}⎿  {preview_result(result)}{RESET}")
     return result
 
 
-def run_turn(messages, system_prompt, session_usage, provider_adapter):
-    turn_usage = new_usage_bucket()
-    provider = provider_adapter["name"]
-    while True:
-        response = call_api(messages, system_prompt, provider)
-        parsed = provider_adapter["parse_response"](response)
-        usage = usage_dict(parsed["usage"])
-        add_usage(turn_usage, usage)
-        add_usage(session_usage, usage)
-
-        for text in parsed["assistant_text"]:
-            if text:
-                print(f"\n{CYAN}⏺{RESET} {render_markdown(text)}")
-
-        messages.append(parsed["assistant_payload"])
-
-        tool_calls = parsed["tool_calls"]
-
-        if not tool_calls:
-            break
-
-        for tool_call in tool_calls:
-            tool_name = tool_call.get("name", "")
-            tool_args = tool_call.get("args") or {}
-            result = execute_tool(tool_name, tool_args)
-            messages.append(provider_adapter["tool_message"](tool_call, result))
-    return turn_usage
+def tool_result_message(provider, tool_call, result):
+    if PROVIDERS[provider]["style"] == "anthropic":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call["id"],
+                    "content": result,
+                }
+            ],
+        }
+    return {"role": "tool", "tool_call_id": tool_call["id"], "content": result}
 
 
 def check_api_key():
     if DRY_RUN:
         return
-    key_name = PROVIDER_ADAPTER["key_env"]
-    if not os.environ.get(key_name):
-        raise RuntimeError(f"{key_name} is required for provider={PROVIDER}")
+    key_env = PROVIDER_CFG["key_env"]
+    if not os.environ.get(key_env):
+        raise RuntimeError(f"{key_env} is required for provider={PROVIDER}")
 
 
 def initial_messages(system_prompt):
-    return PROVIDER_ADAPTER["initial_messages"](system_prompt)
+    return (
+        [{"role": "system", "content": system_prompt}]
+        if PROVIDER_CFG["system_message"]
+        else []
+    )
+
+
+def run_turn(messages, system_prompt, session_usage):
+    turn_usage = new_usage_bucket()
+    while True:
+        parsed = parse_response(PROVIDER, call_api(messages, system_prompt, PROVIDER))
+        usage = usage_dict(parsed["usage"])
+        add_usage(turn_usage, usage)
+        add_usage(session_usage, usage)
+        for text in parsed["assistant_text"]:
+            if text:
+                print(f"\n{CYAN}⏺{RESET} {render_markdown(text)}")
+        messages.append(parsed["assistant_payload"])
+        if not parsed["tool_calls"]:
+            return turn_usage
+        for tool_call in parsed["tool_calls"]:
+            result = execute_tool(
+                tool_call.get("name", ""), tool_call.get("args") or {}
+            )
+            messages.append(tool_result_message(PROVIDER, tool_call, result))
 
 
 def main():
@@ -781,7 +588,6 @@ def main():
     except RuntimeError as err:
         print(f"{RED}⏺ Error: {err}{RESET}")
         return
-
     print(
         f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({PROVIDER_LABEL}) | {os.getcwd()}{RESET}\n"
     )
@@ -789,7 +595,6 @@ def main():
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
     messages = initial_messages(system_prompt)
     session_usage = new_usage_bucket()
-
     while True:
         try:
             print(separator())
@@ -797,9 +602,9 @@ def main():
             print(separator())
             if not user_input:
                 continue
-            if user_input in ("/q", "exit"):
+            if user_input in {"/q", "exit"}:
                 break
-            if user_input in ("/h", "/help"):
+            if user_input in {"/h", "/help"}:
                 print_help()
                 continue
             if user_input == "/stats":
@@ -809,16 +614,11 @@ def main():
                 messages = initial_messages(system_prompt)
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
                 continue
-
             messages.append({"role": "user", "content": user_input})
-
-            turn_usage = run_turn(
-                messages, system_prompt, session_usage, PROVIDER_ADAPTER
+            print_usage_summary(
+                run_turn(messages, system_prompt, session_usage), session_usage
             )
-
-            print_usage_summary(turn_usage, session_usage)
             print()
-
         except (KeyboardInterrupt, EOFError):
             break
         except Exception as err:
