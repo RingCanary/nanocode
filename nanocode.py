@@ -6,7 +6,9 @@ import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, t
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 INCEPTION_KEY = os.environ.get("INCEPTION_API_KEY")
+ZAI_KEY = os.environ.get("ZAI_API_KEY")
 DRY_RUN = os.environ.get("NANOCODE_DRY_RUN", "").lower() in {"1", "true", "yes"}
+ZAI_CODING_PLAN = os.environ.get("NANOCODE_ZAI_CODING_PLAN", "").lower() in {"1", "true", "yes", "on"}
 try:
     REQUEST_TIMEOUT = max(15, int(os.environ.get("NANOCODE_HTTP_TIMEOUT", "30")))
 except ValueError:
@@ -15,10 +17,14 @@ except ValueError:
 
 def detect_provider():
     explicit_provider = os.environ.get("NANOCODE_PROVIDER", "").strip().lower()
-    if explicit_provider in {"anthropic", "openrouter", "inception"}:
+    if explicit_provider in {"anthropic", "openrouter", "inception", "zai", "z_ai"}:
+        if explicit_provider == "z_ai":
+            return "zai"
         return explicit_provider
     if INCEPTION_KEY:
         return "inception"
+    if ZAI_KEY:
+        return "zai"
     if OPENROUTER_KEY:
         return "openrouter"
     return "anthropic"
@@ -29,11 +35,13 @@ PROVIDER_LABEL = {
     "anthropic": "Anthropic",
     "openrouter": "OpenRouter",
     "inception": "Inception",
+    "zai": "z.ai",
 }[PROVIDER]
 API_URL = {
     "anthropic": "https://api.anthropic.com/v1/messages",
     "openrouter": "https://openrouter.ai/api/v1/messages",
     "inception": "https://api.inceptionlabs.ai/v1/chat/completions",
+    "zai": "https://api.z.ai/api/paas/v4/chat/completions",
 }[PROVIDER]
 MODEL = os.environ.get(
     "MODEL",
@@ -41,6 +49,7 @@ MODEL = os.environ.get(
         "anthropic": "claude-opus-4-5",
         "openrouter": "anthropic/claude-opus-4.5",
         "inception": "mercury-2",
+        "zai": "glm-4.5",
     }[PROVIDER],
 )
 
@@ -252,7 +261,7 @@ def make_schema(provider):
             if not is_optional:
                 required.append(param_name)
         schema = {"type": "object", "properties": properties, "required": required}
-        if provider == "inception":
+        if provider in {"inception", "zai"}:
             result.append(
                 {
                     "type": "function",
@@ -411,9 +420,57 @@ def call_api_inception(messages):
     return request_json(request)
 
 
+def call_api_zai(messages, system_prompt):
+    if DRY_RUN:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": f"[dry-run] z.ai request prepared for {API_URL} with model {MODEL}",
+                        **(
+                            {"coding_plan": "[dry-run] coding plan enabled"}
+                            if ZAI_CODING_PLAN
+                            else {}
+                        ),
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
+                "total_tokens": 20,
+            },
+        }
+
+    payload = {
+        "model": MODEL,
+        "max_tokens": 8192,
+        "messages": messages,
+        "tools": make_schema("zai"),
+    }
+    if ZAI_CODING_PLAN:
+        payload["coding_plan"] = True
+    if system_prompt and not any(msg.get("role") == "system" for msg in messages):
+        payload["messages"] = [{"role": "system", "content": system_prompt}, *messages]
+
+    request = urllib.request.Request(
+        API_URL,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {ZAI_KEY or ''}",
+        },
+    )
+    return request_json(request)
+
+
 def call_api(messages, system_prompt):
     if PROVIDER == "inception":
         return call_api_inception(messages)
+    if PROVIDER == "zai":
+        return call_api_zai(messages, system_prompt)
     return call_api_anthropic(messages, system_prompt)
 
 
@@ -638,6 +695,66 @@ def run_inception_turn(messages, system_prompt, session_usage):
     return turn_usage
 
 
+def extract_zai_plan(choice, message):
+    if not ZAI_CODING_PLAN:
+        return ""
+
+    for source in (message, choice):
+        if not isinstance(source, dict):
+            continue
+        for key in ("coding_plan", "plan", "reasoning", "analysis"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                text = value.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+    return ""
+
+
+def run_zai_turn(messages, system_prompt, session_usage):
+    turn_usage = new_usage_bucket()
+    while True:
+        response = call_api(messages, system_prompt)
+        usage = extract_usage(response)
+        add_usage(turn_usage, usage)
+        add_usage(session_usage, usage)
+        choice = (response.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+
+        plan_text = extract_zai_plan(choice, message)
+        if plan_text:
+            print(f"\n{CYAN}⏺{RESET} {render_markdown(plan_text)}")
+
+        text = normalize_openai_content(message.get("content"))
+        if text:
+            print(f"\n{CYAN}⏺{RESET} {render_markdown(text)}")
+
+        tool_calls = message.get("tool_calls") or []
+        assistant_message = {"role": "assistant", "content": text}
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        messages.append(assistant_message)
+
+        if not tool_calls:
+            break
+
+        for tool_call in tool_calls:
+            function_call = tool_call.get("function", {})
+            tool_name = function_call.get("name", "")
+            tool_args = parse_tool_args(function_call.get("arguments"))
+            result = execute_tool(tool_name, tool_args)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id", ""),
+                    "content": result,
+                }
+            )
+    return turn_usage
+
+
 def check_api_key():
     if DRY_RUN:
         return
@@ -647,10 +764,12 @@ def check_api_key():
         raise RuntimeError("OPENROUTER_API_KEY is required for provider=openrouter")
     if PROVIDER == "anthropic" and not ANTHROPIC_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is required for provider=anthropic")
+    if PROVIDER == "zai" and not ZAI_KEY:
+        raise RuntimeError("ZAI_API_KEY is required for provider=zai")
 
 
 def initial_messages(system_prompt):
-    if PROVIDER == "inception":
+    if PROVIDER in {"inception", "zai"}:
         return [{"role": "system", "content": system_prompt}]
     return []
 
@@ -694,6 +813,8 @@ def main():
 
             if PROVIDER == "inception":
                 turn_usage = run_inception_turn(messages, system_prompt, session_usage)
+            elif PROVIDER == "zai":
+                turn_usage = run_zai_turn(messages, system_prompt, session_usage)
             else:
                 turn_usage = run_anthropic_turn(messages, system_prompt, session_usage)
 
