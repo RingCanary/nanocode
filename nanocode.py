@@ -6,7 +6,14 @@ import glob as globlib, json, os, queue, re, select, subprocess, sys, termios, t
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 INCEPTION_KEY = os.environ.get("INCEPTION_API_KEY")
+ZAI_KEY = os.environ.get("ZAI_API_KEY")
 DRY_RUN = os.environ.get("NANOCODE_DRY_RUN", "").lower() in {"1", "true", "yes"}
+ZAI_CODING_PLAN = os.environ.get("NANOCODE_ZAI_CODING_PLAN", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 try:
     REQUEST_TIMEOUT = max(15, int(os.environ.get("NANOCODE_HTTP_TIMEOUT", "30")))
 except ValueError:
@@ -153,6 +160,39 @@ def parse_openai_response(response):
     }
 
 
+def extract_zai_plan(choice, message):
+    if not ZAI_CODING_PLAN:
+        return ""
+
+    for source in (message, choice):
+        if not isinstance(source, dict):
+            continue
+        for key in ("coding_plan", "plan", "reasoning", "analysis"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                text = value.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+    return ""
+
+
+def parse_zai_response(response):
+    parsed = parse_openai_response(response)
+    choice = (response.get("choices") or [{}])[0]
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    plan_text = extract_zai_plan(choice, message)
+    if plan_text:
+        assistant_text = parsed.get("assistant_text")
+        parsed["assistant_text"] = (
+            [plan_text, *assistant_text]
+            if isinstance(assistant_text, list)
+            else [plan_text]
+        )
+    return parsed
+
+
 def build_anthropic_request(messages, system_prompt, provider):
     return {
         "model": MODEL,
@@ -173,11 +213,25 @@ def build_inception_request(messages, _system_prompt, provider):
     }
 
 
+def build_zai_request(messages, _system_prompt, provider):
+    payload = {
+        "model": MODEL,
+        "max_tokens": 8192,
+        "messages": messages,
+        "tools": make_schema(provider),
+    }
+    if ZAI_CODING_PLAN:
+        payload["coding_plan"] = True
+    return payload
+
+
 def detect_provider():
     explicit_provider = os.environ.get("NANOCODE_PROVIDER", "").strip().lower()
+    if explicit_provider == "z_ai":
+        explicit_provider = "zai"
     if explicit_provider in PROVIDERS:
         return explicit_provider
-    for provider in ("inception", "openrouter"):
+    for provider in ("inception", "zai", "openrouter"):
         key_name = PROVIDERS[provider]["key_env"]
         if os.environ.get(key_name):
             return provider
@@ -250,7 +304,31 @@ PROVIDERS = {
             "Accept": "application/json",
             "Authorization": f"Bearer {os.environ.get('INCEPTION_API_KEY', '')}",
         },
-        "initial_messages": lambda system_prompt: [{"role": "system", "content": system_prompt}],
+        "initial_messages": lambda system_prompt: [
+            {"role": "system", "content": system_prompt}
+        ],
+        "tool_message": lambda tool_call, result: {
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": result,
+        },
+    },
+    "zai": {
+        "name": "zai",
+        "label": "z.ai",
+        "api_url": "https://api.z.ai/api/paas/v4/chat/completions",
+        "default_model": "glm-4.5",
+        "key_env": "ZAI_API_KEY",
+        "build_request": build_zai_request,
+        "parse_response": parse_zai_response,
+        "headers": lambda: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {os.environ.get('ZAI_API_KEY', '')}",
+        },
+        "initial_messages": lambda system_prompt: [
+            {"role": "system", "content": system_prompt}
+        ],
         "tool_message": lambda tool_call, result: {
             "role": "tool",
             "tool_call_id": tool_call["id"],
@@ -362,7 +440,8 @@ def grep(args):
 
 def bash(args):
     proc = subprocess.Popen(
-        args["cmd"], shell=True,
+        args["cmd"],
+        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -373,6 +452,9 @@ def bash(args):
     done = object()
 
     def stream_output():
+        if proc.stdout is None:
+            output_queue.put(done)
+            return
         for line in proc.stdout:
             output_queue.put(line)
         output_queue.put(done)
@@ -473,7 +555,7 @@ def make_schema(provider):
             if not is_optional:
                 required.append(param_name)
         schema = {"type": "object", "properties": properties, "required": required}
-        if provider == "inception":
+        if provider in {"inception", "zai"}:
             result.append(
                 {
                     "type": "function",
@@ -524,9 +606,12 @@ def build_request(messages, system_prompt, provider):
 
 def dry_run_response(provider):
     text = f"[dry-run] {PROVIDERS[provider]['label']} request prepared for {PROVIDERS[provider]['api_url']} with model {MODEL}"
-    if provider == "inception":
+    if provider in {"inception", "zai"}:
+        message = {"role": "assistant", "content": text}
+        if provider == "zai" and ZAI_CODING_PLAN:
+            message["coding_plan"] = "[dry-run] coding plan enabled"
         return {
-            "choices": [{"message": {"role": "assistant", "content": text}}],
+            "choices": [{"message": message}],
             "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
         }
     return {
@@ -727,7 +812,9 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
 
-            turn_usage = run_turn(messages, system_prompt, session_usage, PROVIDER_ADAPTER)
+            turn_usage = run_turn(
+                messages, system_prompt, session_usage, PROVIDER_ADAPTER
+            )
 
             print_usage_summary(turn_usage, session_usage)
             print()
